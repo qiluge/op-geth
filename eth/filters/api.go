@@ -30,6 +30,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
@@ -46,14 +47,15 @@ const maxTopics = 4
 // filter is a helper struct that holds meta information over the filter type
 // and associated subscription in the event system.
 type filter struct {
-	typ      Type
-	deadline *time.Timer // filter is inactive when deadline triggers
-	hashes   []common.Hash
-	fullTx   bool
-	txs      []*types.Transaction
-	crit     FilterCriteria
-	logs     []*types.Log
-	s        *Subscription // associated subscription in event system
+	typ          Type
+	deadline     *time.Timer // filter is inactive when deadline triggers
+	hashes       []common.Hash
+	fullTx       bool
+	txs          []*types.Transaction
+	txAndReceipt []*RawTxAndLogs
+	crit         FilterCriteria
+	logs         []*types.Log
+	s            *Subscription // associated subscription in event system
 }
 
 // FilterAPI offers support to create and manage filters. This will allow external clients to retrieve various
@@ -109,6 +111,7 @@ func (api *FilterAPI) timeoutLoop(timeout time.Duration) {
 	}
 }
 
+// 这种poll方式查询pending tx的就不改了，仍旧是推送tx
 // NewPendingTransactionFilter creates a filter that fetches pending transactions
 // as transactions enter the pending state.
 //
@@ -116,8 +119,8 @@ func (api *FilterAPI) timeoutLoop(timeout time.Duration) {
 // `eth_getFilterChanges` polling method that is also used for log filters.
 func (api *FilterAPI) NewPendingTransactionFilter(fullTx *bool) rpc.ID {
 	var (
-		pendingTxs   = make(chan []*types.Transaction)
-		pendingTxSub = api.events.SubscribePendingTxs(pendingTxs)
+		pendingTxs   = make(chan []*RawTxAndLogs)
+		pendingTxSub = api.events.SubscribePendingTxs(pendingTxs, ethereum.FilterQuery{})
 	)
 
 	api.filtersMu.Lock()
@@ -129,8 +132,15 @@ func (api *FilterAPI) NewPendingTransactionFilter(fullTx *bool) rpc.ID {
 			select {
 			case pTx := <-pendingTxs:
 				api.filtersMu.Lock()
+				txs := make([]*types.Transaction, 0)
+				for _, tx := range pTx {
+					t := &types.Transaction{}
+					data, _ := hexutil.Decode(tx.RawTx)
+					_ = rlp.DecodeBytes(data, t)
+					txs = append(txs, t)
+				}
 				if f, found := api.filters[pendingTxSub.ID]; found {
-					f.txs = append(f.txs, pTx...)
+					f.txs = append(f.txs, txs...)
 				}
 				api.filtersMu.Unlock()
 			case <-pendingTxSub.Err():
@@ -145,10 +155,11 @@ func (api *FilterAPI) NewPendingTransactionFilter(fullTx *bool) rpc.ID {
 	return pendingTxSub.ID
 }
 
+// 把receipt和rawTx一起推送过去
 // NewPendingTransactions creates a subscription that is triggered each time a
 // transaction enters the transaction pool. If fullTx is true the full tx is
 // sent to the client, otherwise the hash is sent.
-func (api *FilterAPI) NewPendingTransactions(ctx context.Context, fullTx *bool) (*rpc.Subscription, error) {
+func (api *FilterAPI) NewPendingTransactions(ctx context.Context, crit FilterCriteria) (*rpc.Subscription, error) {
 	notifier, supported := rpc.NotifierFromContext(ctx)
 	if !supported {
 		return &rpc.Subscription{}, rpc.ErrNotificationsUnsupported
@@ -157,24 +168,13 @@ func (api *FilterAPI) NewPendingTransactions(ctx context.Context, fullTx *bool) 
 	rpcSub := notifier.CreateSubscription()
 
 	go func() {
-		txs := make(chan []*types.Transaction, 128)
-		pendingTxSub := api.events.SubscribePendingTxs(txs)
-		chainConfig := api.sys.backend.ChainConfig()
+		txs := make(chan []*RawTxAndLogs, 128)
+		pendingTxSub := api.events.SubscribePendingTxs(txs, ethereum.FilterQuery(crit))
 
 		for {
 			select {
 			case txs := <-txs:
-				// To keep the original behaviour, send a single tx hash in one notification.
-				// TODO(rjl493456442) Send a batch of tx hashes in one notification
-				latest := api.sys.backend.CurrentHeader()
-				for _, tx := range txs {
-					if fullTx != nil && *fullTx {
-						rpcTx := ethapi.NewRPCPendingTransaction(tx, latest, chainConfig)
-						notifier.Notify(rpcSub.ID, rpcTx)
-					} else {
-						notifier.Notify(rpcSub.ID, tx.Hash())
-					}
-				}
+				notifier.Notify(rpcSub.ID, txs)
 			case <-rpcSub.Err():
 				pendingTxSub.Unsubscribe()
 				return
@@ -276,6 +276,45 @@ func (api *FilterAPI) Logs(ctx context.Context, crit FilterCriteria) (*rpc.Subsc
 					log := log
 					notifier.Notify(rpcSub.ID, &log)
 				}
+			case <-rpcSub.Err(): // client send an unsubscribe request
+				logsSub.Unsubscribe()
+				return
+			case <-notifier.Closed(): // connection dropped
+				logsSub.Unsubscribe()
+				return
+			}
+		}
+	}()
+
+	return rpcSub, nil
+}
+
+// BlkLogs creates a subscription that fires for all new log that match the given filter criteria.
+func (api *FilterAPI) BlkLogs(ctx context.Context, crit FilterCriteria) (*rpc.Subscription, error) {
+	notifier, supported := rpc.NotifierFromContext(ctx)
+	if !supported {
+		return &rpc.Subscription{}, rpc.ErrNotificationsUnsupported
+	}
+
+	var (
+		rpcSub      = notifier.CreateSubscription()
+		matchedLogs = make(chan []*types.Log)
+	)
+
+	logsSub, err := api.events.SubscribeLogs(ethereum.FilterQuery(crit), matchedLogs)
+	if err != nil {
+		return nil, err
+	}
+
+	go func() {
+		for {
+			select {
+			case logs := <-matchedLogs:
+				//for _, log := range logs {
+				//	log := log
+				// 这里改成整块推送events
+				notifier.Notify(rpcSub.ID, &logs)
+				//}
 			case <-rpcSub.Err(): // client send an unsubscribe request
 				logsSub.Unsubscribe()
 				return

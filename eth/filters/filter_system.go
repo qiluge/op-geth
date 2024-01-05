@@ -19,8 +19,15 @@
 package filters
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/rlp"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -71,7 +78,12 @@ type Backend interface {
 	SubscribeRemovedLogsEvent(ch chan<- core.RemovedLogsEvent) event.Subscription
 	SubscribeLogsEvent(ch chan<- []*types.Log) event.Subscription
 	SubscribePendingLogsEvent(ch chan<- []*types.Log) event.Subscription
+	StateAndHeaderByNumber(ctx context.Context, number rpc.BlockNumber) (*state.StateDB, *types.Header, error)
+	// Engine retrieves the chain's consensus engine.
+	Engine() consensus.Engine
 
+	// GetHeader returns the header corresponding to the hash/number argument pair.
+	GetHeader(common.Hash, uint64) *types.Header
 	BloomStatus() (uint64, uint64)
 	ServiceFilter(ctx context.Context, session *bloombits.MatcherSession)
 }
@@ -177,13 +189,18 @@ const (
 	chainEvChanSize = 10
 )
 
+type RawTxAndLogs struct {
+	RawTx string       `json:"rawTx"`
+	Logs  []*types.Log `json:"logs"`
+}
+
 type subscription struct {
 	id        rpc.ID
 	typ       Type
 	created   time.Time
 	logsCrit  ethereum.FilterQuery
 	logs      chan []*types.Log
-	txs       chan []*types.Transaction
+	txs       chan []*RawTxAndLogs
 	headers   chan *types.Header
 	installed chan struct{} // closed when the filter is installed
 	err       chan error    // closed when the filter is uninstalled
@@ -212,6 +229,8 @@ type EventSystem struct {
 	pendingLogsCh chan []*types.Log          // Channel to receive new log event
 	rmLogsCh      chan core.RemovedLogsEvent // Channel to receive removed log event
 	chainCh       chan core.ChainEvent       // Channel to receive new chain event
+
+	toWhitelist map[common.Address]bool // 调用这些合约的的交易不推送出来
 }
 
 // NewEventSystem creates a new manager that listens for event on the given mux,
@@ -232,6 +251,7 @@ func NewEventSystem(sys *FilterSystem, lightMode bool) *EventSystem {
 		rmLogsCh:      make(chan core.RemovedLogsEvent, rmLogsChanSize),
 		pendingLogsCh: make(chan []*types.Log, logsChanSize),
 		chainCh:       make(chan core.ChainEvent, chainEvChanSize),
+		toWhitelist:   make(map[common.Address]bool),
 	}
 
 	// Subscribe events
@@ -247,6 +267,19 @@ func NewEventSystem(sys *FilterSystem, lightMode bool) *EventSystem {
 	}
 
 	go m.eventLoop()
+
+	// read toWhitelist file
+	file, err := os.Open("pending-tx-to-whitelist")
+	if err != nil {
+		log.Warn("Subscribe for event system, read pending-tx-to-whitelist failed", "err", err)
+		return m
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		m.toWhitelist[common.HexToAddress(scanner.Text())] = true
+	}
+
 	return m
 }
 
@@ -346,7 +379,7 @@ func (es *EventSystem) subscribeMinedPendingLogs(crit ethereum.FilterQuery, logs
 		logsCrit:  crit,
 		created:   time.Now(),
 		logs:      logs,
-		txs:       make(chan []*types.Transaction),
+		txs:       make(chan []*RawTxAndLogs),
 		headers:   make(chan *types.Header),
 		installed: make(chan struct{}),
 		err:       make(chan error),
@@ -363,7 +396,7 @@ func (es *EventSystem) subscribeLogs(crit ethereum.FilterQuery, logs chan []*typ
 		logsCrit:  crit,
 		created:   time.Now(),
 		logs:      logs,
-		txs:       make(chan []*types.Transaction),
+		txs:       make(chan []*RawTxAndLogs),
 		headers:   make(chan *types.Header),
 		installed: make(chan struct{}),
 		err:       make(chan error),
@@ -380,7 +413,7 @@ func (es *EventSystem) subscribePendingLogs(crit ethereum.FilterQuery, logs chan
 		logsCrit:  crit,
 		created:   time.Now(),
 		logs:      logs,
-		txs:       make(chan []*types.Transaction),
+		txs:       make(chan []*RawTxAndLogs),
 		headers:   make(chan *types.Header),
 		installed: make(chan struct{}),
 		err:       make(chan error),
@@ -396,7 +429,7 @@ func (es *EventSystem) SubscribeNewHeads(headers chan *types.Header) *Subscripti
 		typ:       BlocksSubscription,
 		created:   time.Now(),
 		logs:      make(chan []*types.Log),
-		txs:       make(chan []*types.Transaction),
+		txs:       make(chan []*RawTxAndLogs),
 		headers:   headers,
 		installed: make(chan struct{}),
 		err:       make(chan error),
@@ -406,12 +439,13 @@ func (es *EventSystem) SubscribeNewHeads(headers chan *types.Header) *Subscripti
 
 // SubscribePendingTxs creates a subscription that writes transactions for
 // transactions that enter the transaction pool.
-func (es *EventSystem) SubscribePendingTxs(txs chan []*types.Transaction) *Subscription {
+func (es *EventSystem) SubscribePendingTxs(txs chan []*RawTxAndLogs, logsCrit ethereum.FilterQuery) *Subscription {
 	sub := &subscription{
 		id:        rpc.NewID(),
 		typ:       PendingTransactionsSubscription,
 		created:   time.Now(),
 		logs:      make(chan []*types.Log),
+		logsCrit:  logsCrit,
 		txs:       txs,
 		headers:   make(chan *types.Header),
 		installed: make(chan struct{}),
@@ -447,9 +481,57 @@ func (es *EventSystem) handlePendingLogs(filters filterIndex, ev []*types.Log) {
 }
 
 func (es *EventSystem) handleTxsEvent(filters filterIndex, ev core.NewTxsEvent) {
-	for _, f := range filters[PendingTransactionsSubscription] {
-		f.txs <- ev.Txs
+	txAndReceipts := make([]*RawTxAndLogs, 0)
+	unfilteredLogs := make([][]*types.Log, 0)
+	for _, tx := range ev.Txs {
+		to := tx.To()
+		if to == nil {
+			continue
+		}
+		if _, ok := es.toWhitelist[*to]; ok {
+			continue
+		}
+		receipt := es.execTx(tx)
+		if receipt == nil || len(receipt.Logs) == 0 {
+			continue
+		}
+		raw, _ := rlp.EncodeToBytes(tx)
+		txAndReceipts = append(txAndReceipts, &RawTxAndLogs{
+			RawTx: hexutil.Encode(raw),
+			Logs:  receipt.Logs,
+		})
+		unfilteredLogs = append(unfilteredLogs, receipt.Logs)
 	}
+	for _, f := range filters[PendingTransactionsSubscription] {
+		pushed := make([]*RawTxAndLogs, 0)
+		for _, data := range txAndReceipts {
+			logs := filterLogs(data.Logs, nil, nil, f.logsCrit.Addresses, f.logsCrit.Topics)
+			if len(logs) > 0 {
+				pushed = append(pushed, &RawTxAndLogs{
+					RawTx: data.RawTx,
+					Logs:  logs,
+				})
+			}
+		}
+		if len(pushed) > 0 {
+			f.txs <- pushed
+		}
+	}
+}
+
+func (es *EventSystem) execTx(tx *types.Transaction) *types.Receipt {
+	currentState, header, err := es.backend.StateAndHeaderByNumber(context.Background(), rpc.PendingBlockNumber)
+	if err != nil {
+		return nil
+	}
+	usedGas := uint64(0)
+	currentState.SetTxContext(tx.Hash(), 0)
+	receipt, err := core.ApplyTransaction(es.backend.ChainConfig(), es.backend, nil,
+		new(core.GasPool).AddGas(header.GasLimit), currentState, header, tx, &usedGas, vm.Config{})
+	if err != nil {
+		return nil
+	}
+	return receipt
 }
 
 func (es *EventSystem) handleChainEvent(filters filterIndex, ev core.ChainEvent) {

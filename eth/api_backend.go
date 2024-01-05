@@ -448,3 +448,7 @@ func (b *EthAPIBackend) HistoricalRPCService() *rpc.Client {
 func (b *EthAPIBackend) Genesis() *types.Block {
 	return b.eth.blockchain.Genesis()
 }
+
+func (b *EthAPIBackend) GetHeader(hash common.Hash, height uint64) *types.Header {
+	return b.eth.blockchain.GetHeader(hash, height)
+}

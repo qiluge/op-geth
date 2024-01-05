@@ -988,6 +988,26 @@ func (fb *filterBackend) PendingBlockAndReceipts() (*types.Block, types.Receipts
 	return fb.backend.pendingBlock, fb.backend.pendingReceipts
 }
 
+func (fb *filterBackend) StateAndHeaderByNumber(ctx context.Context, number rpc.BlockNumber) (*state.StateDB, *types.Header, error) {
+	header, err := fb.HeaderByNumber(ctx, number)
+	if err != nil {
+		return nil, nil, err
+	}
+	stateDB, err := fb.backend.stateByBlockNumber(ctx, header.Number)
+	if err != nil {
+		return nil, nil, err
+	}
+	return stateDB, header, nil
+}
+
+func (fb *filterBackend) Engine() consensus.Engine {
+	return nil
+}
+
+func (fb *filterBackend) GetHeader(hash common.Hash, height uint64) *types.Header {
+	return fb.bc.GetHeader(hash, height)
+}
+
 func (fb *filterBackend) GetReceipts(ctx context.Context, hash common.Hash) (types.Receipts, error) {
 	number := rawdb.ReadHeaderNumber(fb.db, hash)
 	if number == nil {

@@ -205,7 +205,7 @@ func (config *Config) sanitize() Config {
 type LegacyPool struct {
 	config      Config
 	chainconfig *params.ChainConfig
-	chain       BlockChain
+	chain       *core.BlockChain
 	gasTip      atomic.Pointer[big.Int]
 	txFeed      event.Feed
 	signer      types.Signer
@@ -244,7 +244,7 @@ type txpoolResetRequest struct {
 
 // New creates a new transaction pool to gather, sort and filter inbound
 // transactions from the network.
-func New(config Config, chain BlockChain) *LegacyPool {
+func New(config Config, chain *core.BlockChain) *LegacyPool {
 	// Sanitize the input to ensure no vulnerable gas prices are set
 	config = (&config).sanitize()
 

@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/ethereum/go-ethereum/eth/filters"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum"
@@ -451,6 +452,22 @@ func (ec *Client) SubscribeFilterLogs(ctx context.Context, q ethereum.FilterQuer
 	return sub, nil
 }
 
+// SubscribeFilterLogs subscribes to the results of a streaming filter query.
+func (ec *Client) SubscribeBlkLogs(ctx context.Context, q ethereum.FilterQuery, ch chan<- []types.Log) (ethereum.Subscription, error) {
+	arg, err := toFilterArg(q)
+	if err != nil {
+		return nil, err
+	}
+	sub, err := ec.c.EthSubscribe(ctx, ch, "blkLogs", arg)
+	if err != nil {
+		// Defensively prefer returning nil interface explicitly on error-path, instead
+		// of letting default golang behavior wrap it with non-nil interface that stores
+		// nil concrete type value.
+		return nil, err
+	}
+	return sub, nil
+}
+
 func toFilterArg(q ethereum.FilterQuery) (interface{}, error) {
 	arg := map[string]interface{}{
 		"address": q.Addresses,
@@ -470,6 +487,19 @@ func toFilterArg(q ethereum.FilterQuery) (interface{}, error) {
 		arg["toBlock"] = toBlockNumArg(q.ToBlock)
 	}
 	return arg, nil
+}
+
+// SubscribeFilterLogs subscribes to the results of a streaming filter query.
+func (ec *Client) SubscribePendingTxs(ctx context.Context, q ethereum.FilterQuery, ch chan<- []filters.RawTxAndLogs) (ethereum.Subscription, error) {
+	arg, err := toFilterArg(q)
+	if err != nil {
+		return nil, err
+	}
+	sub, err := ec.c.EthSubscribe(ctx, ch, "newPendingTransactions", arg)
+	if err != nil {
+		return nil, err
+	}
+	return sub, nil
 }
 
 // Pending State
@@ -567,6 +597,44 @@ func (ec *Client) SuggestGasTipCap(ctx context.Context) (*big.Int, error) {
 		return nil, err
 	}
 	return (*big.Int)(&hex), nil
+}
+
+func (ec *Client) SendRawTransaction(ctx context.Context, tx string) error {
+	return ec.c.CallContext(ctx, nil, "eth_sendRawTransaction", tx)
+}
+
+type RootHashOrSlots struct {
+	RootHash  *common.Hash
+	SlotValue map[common.Hash]common.Hash
+}
+
+func (r *RootHashOrSlots) UnmarshalJSON(data []byte) error {
+	var hash common.Hash
+	var err error
+	if err = json.Unmarshal(data, &hash); err == nil {
+		r.RootHash = &hash
+		return nil
+	}
+	return json.Unmarshal(data, &r.SlotValue)
+}
+
+func (r RootHashOrSlots) MarshalJSON() ([]byte, error) {
+	if r.RootHash != nil {
+		return json.Marshal(*r.RootHash)
+	}
+	return json.Marshal(r.SlotValue)
+}
+
+type ConditionalOptions struct {
+	KnownAccounts  map[common.Address]RootHashOrSlots `json:"knownAccounts"`
+	BlockNumberMin *hexutil.Uint64                    `json:"blockNumberMin,omitempty"`
+	BlockNumberMax *hexutil.Uint64                    `json:"blockNumberMax,omitempty"`
+	TimestampMin   *hexutil.Uint64                    `json:"timestampMin,omitempty"`
+	TimestampMax   *hexutil.Uint64                    `json:"timestampMax,omitempty"`
+}
+
+func (ec *Client) SendConditionalTransaction(ctx context.Context, tx string, options *ConditionalOptions) error {
+	return ec.c.CallContext(ctx, nil, "eth_sendRawTransactionConditional", tx, options)
 }
 
 type feeHistoryResultMarshaling struct {

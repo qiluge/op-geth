@@ -343,3 +343,7 @@ func (b *LesApiBackend) HistoricalRPCService() *rpc.Client {
 func (b *LesApiBackend) Genesis() *types.Block {
 	return b.eth.blockchain.Genesis()
 }
+
+func (b *LesApiBackend) GetHeader(hash common.Hash, height uint64) *types.Header {
+	return b.eth.blockchain.GetHeader(hash, height)
+}
